@@ -88,6 +88,11 @@ uint32_t sdIndex  = 0;    // next "/img_NNNNN.jpg" index
 const int LORA_SCK = 5, LORA_MISO = 19, LORA_MOSI = 27;
 const int LORA_SS = 18, LORA_RST = 23, LORA_DIO0 = 26;
 #define LORA_BAND 915E6
+// LoRa signal bandwidth. The SX127x default is 125 kHz; raising it ~halves airtime
+// per doubling (250E3 ~2x, 500E3 ~4x) at the cost of ~3 dB sensitivity each step --
+// a good trade on a short-range link. The receiver must match: receiver.ino's
+// setSignalBandwidth and decode_lora_image.py's BW (or its --bw flag).
+#define LORA_BW 500E3
 SPIClass loraSPI(HSPI);
 
 // --- OLED (I2C, optional/non-fatal) ---
@@ -100,7 +105,10 @@ bool haveOLED = false;
 
 // --- LoRa transfer protocol (must match the loracam receiver) ---
 #define LORA_TRANSFER_BUFFER 250
-const int delayMillis = 75;
+// Gap after every packet. arduino-LoRa's endPacket() already blocks until TxDone, so
+// this is pure dead air on top of airtime; trimmed 75 -> 10 ms as part of the PHY
+// speedup (the receiver's burst detector only ends a burst after 0.5 s of silence).
+const int delayMillis = 10;
 const uint8_t header[]      = {0x61, 0x79, 0x79, 0x79, 0x79};
 const uint8_t fingerprint[] = {0x6c, 0x6d, 0x61, 0x6f};
 uint8_t lora_buffer[LORA_TRANSFER_BUFFER];
@@ -390,10 +398,19 @@ void setup() {
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setSPI(loraSPI);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_BAND))
+  if (!LoRa.begin(LORA_BAND)) {
     Serial.println("LoRa init failed! (check antenna/band)");
-  else
-    Serial.println("LoRa init ok.");
+  } else {
+    // Pin the full PHY explicitly instead of relying on SX127x reset defaults, so the
+    // radio config is unambiguous and matches the receiver. SF7/CR4-5/sync 0x12 equal
+    // the old defaults; LORA_BW is the throughput knob (see its #define above).
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x12);
+    Serial.printf("LoRa init ok (SF7, BW=%.0f kHz, CR4/5, delay=%dms).\n",
+                  (double)LORA_BW / 1000.0, delayMillis);
+  }
 
   // OLED status display -- optional (haveOLED stays false when off, so oledMsg()
   // no-ops). When disabled we don't power the panel up; instead we explicitly force

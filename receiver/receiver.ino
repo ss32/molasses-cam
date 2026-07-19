@@ -18,6 +18,8 @@ https://www.lilygo.cc/products/lora3
                 // If your board is an older LoRa32 (v1.0/v1.6), change this back to 14.
 #define DI0 26  // GPIO26 -- SX1278's IRQ(Interrupt Request)
 #define BAND 915E6
+// Must match the transmitter's LORA_BW in sender/sender.ino (125E3 / 250E3 / 500E3).
+#define LORA_BW 500E3
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
@@ -170,7 +172,7 @@ void setup()
   // but setting them explicitly means a stale radio state can never cause a silent
   // mismatch (freq is set by LoRa.begin(BAND) above; the TX uses these same values).
   LoRa.setSpreadingFactor(7);      // SF7
-  LoRa.setSignalBandwidth(125E3);  // BW 125 kHz
+  LoRa.setSignalBandwidth(LORA_BW);  // BW (matches sender's LORA_BW)
   LoRa.setCodingRate4(5);          // CR 4/5
   LoRa.setSyncWord(0x12);          // private-network sync word
 
