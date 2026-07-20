@@ -111,26 +111,22 @@ Make sure to point it at the **receive node** if both boards are on the same mac
 python3 ./receive.py --port /dev/ttyACM1
 ```
 
-It prompts each round:
+On a real terminal it opens a full-screen **dashboard** (curses, no extra deps). Each
+round a config form appears: highlight **Mode** (continuous / specific count) and
+**Resolution** with the arrow keys, type in **Delay** (s) and **Count**, then navigate to
+**Send**. A live line at the bottom previews the packed config word as you edit.
 
-```
-Send a new configuration? [y/N]
-```
+- **Send** --> the request goes out, the dashboard waits for the sender's ACK (resending
+  until the sender reaches a listen window), then streams status into its log: per-image
+  headers, a live progress bar, and the post-image Reed–Solomon/FEC summary. *Specific
+  count* saves exactly `COUNT` images then reopens the form; *continuous* saves until you
+  press **q**.
+- **Cancel** (or `q`/Esc) --> passively save every image the sender streams. Press **q**
+  to return to the form; **Ctrl-C** quits.
 
-- **No** --> passively save every image the sender streams (Ctrl-C returns to the prompt).
-- **Yes** --> pick **Mode** (continuous / specific count)
-
-  **Resolution** (0–13, table
-  below)
-  
-  **Delay** between frames (s) 
-
-  **Count** number of pictures to take in sequence if not in continuous mode
-  
-  It sends the request, waits for the
-  sender's ACK (resending until the sender reaches a listen window), then:
-  - *specific count* --> saves exactly `COUNT` images, then re-prompts;
-  - *continuous* --> saves images until Ctrl-C.
+When stdout isn't a terminal (piped / redirected), it falls back to the original plain
+`Send a new configuration? [y/N]` text prompts and line-by-line output, so scripted and
+headless use is unchanged.
 
 Images are written as `<YYYYMMDD>/<unix>.png` timestamped with Unix seconds.
 
@@ -142,7 +138,10 @@ Images are written as `<YYYYMMDD>/<unix>.png` timestamped with Unix seconds.
 ```
 
 The SDR can't transmit, so it never sends configs, it
-just decodes whatever the sender puts on the air. 
+just decodes whatever the sender puts on the air. On a terminal it shows the same
+dashboard as the serial path -- minus the config form -- streaming each inbound burst's
+progress bar and decode/FEC result into the log (**q** or Ctrl-C to quit); piped or with
+`--file` into a non-terminal it prints the original timestamped log lines instead.
 
 
 

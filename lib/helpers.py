@@ -176,6 +176,17 @@ def dated_png_path(outdir, unix):
     return os.path.join(day, f"{unix}.png")
 
 
+# Optional UI sink. When a curses Dashboard (lib.ui) is active it registers itself
+# here so log lines land in the dashboard instead of scrolling stdout; left None for
+# headless / piped runs, where log() just prints as before.
+UI = None
+
+
 def log(msg):
-    """Timestamped (UTC) line to stdout, flushed -- used by the SDR path's logging."""
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z] {msg}", flush=True)
+    """Timestamped (UTC) line -- used by the SDR path's logging. Routes to the active
+    UI sink if one is registered (lib.ui.Dashboard), else prints to stdout, flushed."""
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z] {msg}"
+    if UI is not None:
+        UI.log(line)
+    else:
+        print(line, flush=True)

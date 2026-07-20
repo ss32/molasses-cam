@@ -606,17 +606,14 @@ def sniff_count(blocks, rate, shared):
         pass
 
 
-def render_progress(elapsed, N, done=False):
-    """Draw an in-place progress bar on stderr for the burst currently arriving."""
+def render_progress(ui, elapsed, N, done=False):
+    """Update the UI's progress bar for the burst currently arriving. Packet count is
+    time-estimated (the burst carries no running count), so it's approximate."""
     if N:
         k = N if done else min(N, max(0.0, elapsed / PKT_S - 2))  # -2: header+count
-        frac = k / N
-        w = 24
-        bar = helpers.progress_bar(frac, w)
-        sys.stderr.write(f"\r  receiving [{bar}] {frac*100:3.0f}%  ~{int(round(k))}/{N} pkts  {elapsed:4.1f}s   ")
+        ui.progress(k / N, "receiving", f"~{int(round(k))}/{N} pkts  {elapsed:4.1f}s")
     else:
-        sys.stderr.write(f"\r  receiving image... {elapsed:4.1f}s (reading count)   ")
-    sys.stderr.flush()
+        ui.progress(None, "receiving image...", f"{elapsed:4.1f}s (reading count)")
 
 
 def decoder_worker(q, args, pool):
@@ -768,6 +765,14 @@ def sdr_main(args):
         pool = ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init)
         list(pool.map(time.sleep, [0.02] * args.workers))   # pre-fork all workers
 
+    # Status UI: a curses Dashboard when stdout is a TTY (all packet status streams into
+    # it), else the plain ConsoleUI. Created AFTER the decode pool is forked so no worker
+    # inherits a live curses screen. helpers.log() routes to it while it's registered, so
+    # the SDR-only log calls (including the decoder thread's) land in the dashboard.
+    from lib.ui import make_ui
+    ui = make_ui("SDR", f"{args.rate / 1e6:g}Msps")
+    helpers.UI = ui
+
     # Pick the IQ source: an explicit file, IQ piped on stdin, or (default) our own
     # rtl_sdr subprocess so the user only has to run this script.
     proc = None
@@ -786,6 +791,7 @@ def sdr_main(args):
     src = "rtl_sdr" if proc else (args.file or "stdin")
     helpers.log(f"monitoring: src={src} fmt={fmt} rate={args.rate/1e6}Msps thr={args.threshold_db}dB "
                 f"gap={args.gap}s workers={args.workers} outdir={os.path.abspath(args.outdir)}")
+    ui.status(f"Monitoring {src} @ {args.rate/1e6:g}Msps -- waiting for transmissions")
 
     noise = None
     thr_lin = 10 ** (args.threshold_db / 10)
@@ -798,6 +804,8 @@ def sdr_main(args):
 
     try:
         for blk in iq_blocks(stream, fmt, block_samps, pace=pace):
+            if ui.check_quit():                             # 'q' in the dashboard -> stop
+                break
             p = block_power(blk)
             if noise is None:
                 noise = p
@@ -822,15 +830,15 @@ def sdr_main(args):
                                      daemon=True).start()
                     sniffed = True
                 if show and time.time() - last_draw > 0.2:  # throttle the redraw
-                    render_progress(time.time() - t0, shared.get("N"))
+                    render_progress(ui, time.time() - t0, shared.get("N"))
                     last_draw = time.time()
                 if quiet >= gap_blocks or nblk >= max_blocks:
                     active = (nblk - quiet) * block_dur
                     recording = False
                     prebuf.clear()
                     if show:
-                        render_progress(time.time() - t0, shared.get("N"), done=True)
-                        sys.stderr.write("\n"); sys.stderr.flush()
+                        render_progress(ui, time.time() - t0, shared.get("N"), done=True)
+                        ui.end_progress()
                     if active >= args.min_burst:
                         iq = np.concatenate(buf)
                         try:
@@ -848,6 +856,8 @@ def sdr_main(args):
             except subprocess.TimeoutExpired:
                 proc.kill()
         q.put(None)
-        worker.join(timeout=60)
+        worker.join(timeout=60)                           # decoder logs its last saves here
         if pool is not None:
             pool.shutdown()
+        helpers.UI = None                                 # stop routing before we tear down
+        ui.close()

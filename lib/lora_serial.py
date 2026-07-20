@@ -13,7 +13,6 @@ are imported lazily inside the functions that need them, so a machine set up onl
 for the SDR path never needs opencv/pyserial.
 """
 import os
-import sys
 import time
 
 import numpy as np
@@ -76,25 +75,25 @@ def reassemble(packets):
     return jpg, dict(v2=False, packets=len(packets))
 
 
-def show_and_save(jpg, stats, outdir="."):
+def show_and_save(jpg, stats, ui, outdir="."):
     if not jpg:
-        print(f"  no image ({stats}) -- skipped")
+        ui.log(f"  no image ({stats}) -- skipped")
         return
     arr = np.frombuffer(jpg, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        print(f"  JPEG undecodable ({stats}) -- skipped")
+        ui.log(f"  JPEG undecodable ({stats}) -- skipped")
         return
     # Same layout as the SDR path: <outdir>/<YYYYMMDD UTC>/<unix>.png, new dir per UTC day.
     path = helpers.dated_png_path(outdir, int(time.time()))
     cv2.imwrite(path, img)
     if stats.get("v2"):
-        print(f"  saved {img.shape[1]}x{img.shape[0]} -> {path}  "
-              f"[v2 Ndata={stats['Ndata']} present={stats['present']} "
-              f"recovered={stats['recovered']} unrecoverable={stats['unrecoverable']} "
-              f"crc_fail={stats['crc_fail']}]")
+        ui.log(f"  saved {img.shape[1]}x{img.shape[0]} -> {path}  "
+               f"[v2 Ndata={stats['Ndata']} present={stats['present']} "
+               f"recovered={stats['recovered']} unrecoverable={stats['unrecoverable']} "
+               f"crc_fail={stats['crc_fail']}]")
     else:
-        print(f"  saved {img.shape[1]}x{img.shape[0]} -> {path}  [v1 {stats['packets']} pkts]")
+        ui.log(f"  saved {img.shape[1]}x{img.shape[0]} -> {path}  [v1 {stats['packets']} pkts]")
 
 
 def _ask_int(label, lo, hi, default):
@@ -111,10 +110,9 @@ def _ask_int(label, lo, hi, default):
         print(f"  out of range {lo}-{hi}")
 
 
-def prompt_config():
-    """Interactively build a 32-bit config word, or return None to just listen passively."""
-    if input("\nSend a new configuration? [y/N] ").strip().lower() not in ("y", "yes"):
-        return None
+def _prompt_config_text():
+    """Plain line-by-line fallback used when a curses TUI can't run (non-tty host or
+    curses unavailable). Returns (mode, res, delay, count) selections."""
     print("Mode:  0) continuous   1) specific count")
     mode = _ask_int("Mode", 0, 1, 0)
     print("Resolution:")
@@ -124,13 +122,30 @@ def prompt_config():
     res = _ask_int("Resolution index", 0, len(RES_NAMES) - 1, RES_DEFAULT)
     delay = _ask_int("Delay between frames (s)", 0, 32767, 5)
     count = _ask_int("Count (images)", 0, 4095, 1) if mode == 1 else 0
+    return mode, res, delay, count
+
+
+def _console_config():
+    """Non-TUI config prompt (the [y/N] gate + plain text fields), used by ConsoleUI /
+    non-tty hosts. Returns a selections dict {mode,res,delay,count} or None to listen."""
+    if input("\nSend a new configuration? [y/N] ").strip().lower() not in ("y", "yes"):
+        return None
+    mode, res, delay, count = _prompt_config_text()
+    return dict(mode=mode, res=res, delay=delay, count=count)
+
+
+def cfg_from_selection(sel):
+    """Pack a selections dict into the 32-bit config word (count ignored unless the
+    mode is 'specific count'), returning (cfg, summary_line)."""
+    mode, res, delay = sel["mode"], sel["res"], sel["delay"]
+    count = sel["count"] if mode == 1 else 0
     cfg = pack_config(mode, res, delay, count)
-    print(f"  -> config 0x{cfg:08X}  (mode={'continuous' if mode == 0 else 'count'}, "
-          f"res={RES_NAMES[res]}, delay={delay}s, count={count})")
-    return cfg
+    summary = (f"  -> config 0x{cfg:08X}  (mode={'continuous' if mode == 0 else 'count'}, "
+               f"res={RES_NAMES[res]}, delay={delay}s, count={count})")
+    return cfg, summary
 
 
-def wait_for_ack(ser, expected, timeout):
+def wait_for_ack(ser, expected, timeout, ui):
     """Scan forwarded hex lines up to `timeout` s for a valid ACK; True if it matches."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -146,11 +161,11 @@ def wait_for_ack(ser, expected, timeout):
             continue
         if ack == expected:
             return True
-        print(f"  ACK mismatch: got 0x{ack:08X}, expected 0x{expected:08X}")
+        ui.log(f"  ACK mismatch: got 0x{ack:08X}, expected 0x{expected:08X}")
     return False
 
 
-def send_request(ser, cfg, budget=120.0):
+def send_request(ser, cfg, ui, budget=120.0):
     """Push the request out through the receiver node and wait for the sender's ACK.
     Resends periodically for up to `budget` s -- the sender only hears us during its
     inter-frame listen window, so a request sent mid-image must be retried."""
@@ -162,50 +177,47 @@ def send_request(ser, cfg, budget=120.0):
         attempt += 1
         ser.reset_input_buffer()          # drop any in-flight image bytes before the ACK
         ser.write(cmd)
-        print(f"  request sent (attempt {attempt}); waiting for ACK...")
-        if wait_for_ack(ser, expected, timeout=6.0):
-            print("  ACK OK")
+        ui.log(f"  request sent (attempt {attempt}); waiting for ACK...")
+        if wait_for_ack(ser, expected, timeout=6.0, ui=ui):
+            ui.log("  ACK OK")
             return True
-    print("  no ACK -- sender offline or never reached a listen window; back to menu")
+    ui.log("  no ACK -- sender offline or never reached a listen window; back to menu")
     return False
 
 
-def render_serial_progress(recv, total):
-    """In-place progress bar on stderr for the image currently arriving over serial.
-    Unlike the SDR bar this is exact -- we count real packets against the params total."""
-    w = 24
-    if total:
-        frac = min(1.0, recv / total)
-        bar = helpers.progress_bar(frac, w)
-        sys.stderr.write(f"\r  receiving [{bar}] {frac * 100:3.0f}%  {recv}/{total} pkts   ")
-    else:
-        sys.stderr.write(f"\r  receiving [{'.' * w}]  {recv} pkts (reading params)   ")
-    sys.stderr.flush()
-
-
-def receive_images(ser, n=None, idle_finalize=3.0, outdir=".", progress=True):
+def receive_images(ser, ui, n=None, idle_finalize=3.0, outdir=".", progress=True):
     """Collect header..fingerprint bursts and save each. Stop after n images (n=None:
-    forever). Same reassembly as before, refactored so a config run can bound it to n.
-    If the burst's single (unprotected) fingerprint packet is lost, finalize the image
-    after `idle_finalize` s of silence -- intra-image gaps are ~10 ms, so this can't fire
-    mid-image, and it prevents a count run from hanging on a dropped trailing fingerprint.
-    When `progress`, a live packet bar is drawn on stderr for each incoming image."""
+    forever), or early if `ui.check_quit()` reports the user asked to return to the menu.
+    Returns the number of images saved. Same reassembly as before, refactored so a config
+    run can bound it to n. If the burst's single (unprotected) fingerprint packet is lost,
+    finalize the image after `idle_finalize` s of silence -- intra-image gaps are ~10 ms,
+    so this can't fire mid-image, and it prevents a count run from hanging on a dropped
+    trailing fingerprint. When `progress`, a live packet bar is shown for each image."""
     collecting, packets, got, last_rx = False, [], 0, time.time()
     recv = 0            # data/parity (250-byte) packets seen this image
     total = None        # expected data+parity count, learned from the params packet
 
+    def show_progress():
+        if not progress:
+            return
+        if total:
+            ui.progress(min(1.0, recv / total), "receiving", f"{recv}/{total} pkts")
+        else:
+            ui.progress(None, "receiving", f"{recv} pkts (reading params)")
+
     def finalize(msg):
         nonlocal got
         if progress:
-            render_serial_progress(recv, total)
-            sys.stderr.write("\n")          # leave the completed bar on its own line
-            sys.stderr.flush()
+            show_progress()
+            ui.end_progress()
         if msg:
-            print(msg)
-        show_and_save(*reassemble(packets), outdir=outdir)
+            ui.log(msg)
+        show_and_save(*reassemble(packets), ui=ui, outdir=outdir)
         got += 1
 
     while n is None or got < n:
+        if ui.check_quit():                  # user pressed q -- back to the menu
+            break
         line = ser.readline().strip()
         if not line:
             if collecting and packets and time.time() - last_rx > idle_finalize:
@@ -224,7 +236,7 @@ def receive_images(ser, n=None, idle_finalize=3.0, outdir=".", progress=True):
                 finalize("  (no fingerprint seen -- finalizing on next header)")
                 if n is not None and got >= n:
                     break
-            print(f"[{time.strftime('%H:%M:%S')}] header -- receiving image")
+            ui.log(f"[{time.strftime('%H:%M:%S')}] header -- receiving image")
             collecting, packets, recv, total = True, [], 0, None
             continue
         if not collecting:
@@ -239,8 +251,8 @@ def receive_images(ser, n=None, idle_finalize=3.0, outdir=".", progress=True):
             total = helpers.params_total(params) if params else None
         if len(pkt) == helpers.LORA_PAYLOAD:    # a data or parity packet arrived
             recv += 1
-            if progress:
-                render_serial_progress(recv, total)
+            show_progress()
+    return got
 
 
 def serial_present(port):
@@ -262,42 +274,59 @@ def serial_present(port):
 
 def serial_main(args):
     """Interactive LoRa config link: optionally push a config to the sender, then save the
-    reassembled image(s). Declining a config falls back to today's passive save loop."""
+    reassembled image(s). Declining a config falls back to a passive save loop.
+
+    On a real terminal the whole session runs inside a curses Dashboard (lib.ui): the
+    config form opens modally, and headers / progress / FEC results stream into the
+    dashboard's log. 'q' during a receive returns to the config form; Ctrl-C quits. On a
+    non-tty host a ConsoleUI reproduces the original plain prompts and stdout/stderr."""
     global cv2
     import cv2                                            # noqa: F401 (bound to global, used by show_and_save)
     import serial
+    from lib.ui import make_ui
 
     ser = serial.Serial(args.port, args.baud, timeout=1)
-    print("Connected to", args.port, "-- LoRa config link (Ctrl-C to quit)")
+    ui = make_ui("serial", args.port)
+    progress = not args.no_progress
+
+    def receive(n, status):
+        """Run a receive loop, letting the Dashboard's Ctrl-C quit the whole session
+        while ConsoleUI's Ctrl-C just returns to the menu (the original behaviour).
+        Returns images saved."""
+        ui.status(status)
+        try:
+            return receive_images(ser, ui, n, outdir=args.outdir, progress=progress)
+        except KeyboardInterrupt:
+            if ui.interactive_form:
+                raise                                    # dashboard: Ctrl-C -> quit
+            ui.end_progress()                            # console: Ctrl-C -> back to menu
+            return 0
+
+    from lib import tui
     try:
+        ui.log(f"Connected to {args.port} -- LoRa config link")
         while True:
-            cfg = prompt_config()
-            if cfg is None:
-                print("Listening for images (Ctrl-C to return to menu)...")
-                try:
-                    receive_images(ser, None, outdir=args.outdir, progress=not args.no_progress)
-                except KeyboardInterrupt:
-                    print()
+            sel = (ui.config_form(RES_NAMES, RES_DIMS, RES_DEFAULT)
+                   if ui.interactive_form else _console_config())
+            if sel == tui.QUIT:                          # Exit button -> quit program
+                break
+            if sel is None:                              # declined -> passive listen
+                receive(None, "Listening for images (q returns to menu)...")
                 continue
-            if not send_request(ser, cfg):
+            cfg, summary = cfg_from_selection(sel)
+            ui.log(summary)
+            if not send_request(ser, cfg, ui):
                 continue
             if cfg & 0x1:                                 # specific count
                 n = max(1, (cfg >> 20) & 0xFFF)
-                print(f"Waiting for {n} image(s)...")
-                try:
-                    receive_images(ser, n, outdir=args.outdir, progress=not args.no_progress)
-                    print(f"Received {n} image(s).")
-                except KeyboardInterrupt:
-                    print()
+                if receive(n, f"Waiting for {n} image(s)...") >= n:
+                    ui.log(f"Received {n} image(s).")
             else:                                         # continuous
-                print("Continuous mode -- receiving (Ctrl-C to return to menu)...")
-                try:
-                    receive_images(ser, None, outdir=args.outdir, progress=not args.no_progress)
-                except KeyboardInterrupt:
-                    print()
+                receive(None, "Continuous mode -- receiving (q returns to menu)...")
     except KeyboardInterrupt:
-        print("\nstopped")
+        ui.log("stopped")
     finally:
+        ui.close()
         try:
             cv2.destroyAllWindows()
         except Exception:
