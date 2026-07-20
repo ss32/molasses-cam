@@ -158,7 +158,11 @@ void processPacket(uint8_t *packet_buffer, int packetSize)
 
 void setup()
 {
-  Serial.begin(38400);
+  // 115200, not 38400: each 250-byte packet forwards as ~500 hex chars, which at 38400
+  // takes ~131 ms -- longer than the ~55 ms inter-packet gap of the fast PHY (BW=500 kHz),
+  // so the single-deep RX handoff dropped packets faster than the FEC could recover. At
+  // 115200 the ~44 ms dump fits inside the gap. receive.py's BAUD must match.
+  Serial.begin(115200);
   Serial.println("LoRa Receiver Callback");
   SPI.begin(SCK, MISO, MOSI, SS);
   LoRa.setPins(SS, RST, DI0);
@@ -225,8 +229,65 @@ void lowerMessage(String s)
   display.setTextSize(1);
   display.print(s);
 }
+// ---- Serial -> LoRa relay ---------------------------------------------------------
+// receive.py drives the two-way config link by sending us a line "TX<hex>" over serial;
+// we hex-decode the payload and transmit it verbatim over LoRa (the request/ACK format
+// lives entirely in the sender + receive.py -- this node is a dumb pipe). After a TX we
+// re-arm RX_CONTINUOUS so image/ACK reception resumes.
+char cmdBuf[160];
+uint16_t cmdLen = 0;
+
+static int hexVal(char c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+void handleSerialCommand()
+{
+  while (Serial.available())
+  {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r')
+    {
+      if (cmdLen >= 2 && cmdBuf[0] == 'T' && cmdBuf[1] == 'X')
+      {
+        uint8_t out[255];
+        uint16_t n = 0;
+        for (uint16_t i = 2; i + 1 < cmdLen && n < sizeof(out); i += 2)
+        {
+          int hi = hexVal(cmdBuf[i]), lo = hexVal(cmdBuf[i + 1]);
+          if (hi < 0 || lo < 0) break;
+          out[n++] = (uint8_t)((hi << 4) | lo);
+        }
+        if (n)
+        {
+          LoRa.beginPacket();
+          LoRa.write(out, n);
+          LoRa.endPacket();
+          LoRa.receive();           // back to RX_CONTINUOUS for image/ACK reception
+          Serial.print("TXOK ");
+          Serial.println(n);
+        }
+      }
+      cmdLen = 0;
+    }
+    else if (cmdLen < sizeof(cmdBuf) - 1)
+    {
+      cmdBuf[cmdLen++] = ch;
+    }
+    else
+    {
+      cmdLen = 0;                   // overflow -- drop the line
+    }
+  }
+}
+
 void loop()
 {
+  handleSerialCommand();
   if (rxReady)
   {
     // Copy out under the rxReady handshake (the ISR won't touch rxBuf while it's set),

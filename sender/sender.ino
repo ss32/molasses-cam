@@ -39,13 +39,12 @@
 #include "SD.h"
 
 
-// Also save each captured JPEG to the on-board MicroSD card.
-// Non-blocking, will transmit if there's a card failure
+// Save each captured JPEG to the on-board MicroSD card.
+// Non-blocking if there's a card failure
 const bool SAVE_TO_SD = true;
 
-// Drive the on-board SSD1306 OLED with status text. Disabled by default to save
-// battery -- when false the panel is never initialized or powered on (and every
-// oledMsg() call is a no-op). Set true to show capture/send progress.
+// Drive the on-board SSD1306 OLED with status text. 
+// Set true to show capture/send progress.
 const bool USE_OLED = true;
 
 // Available CAPTURE_MODE values (Arducam MEGA CAM_IMAGE_MODE_*):
@@ -58,7 +57,7 @@ const bool USE_OLED = true;
 //   CAM_IMAGE_MODE_SVGA        800x600
 //////////////////// HERE BE DRAGONS ///////////////////////////////////
 //// The camera lies about some of these sizes and returns VGA images
-//// Or maybe the library is broken. See the timing study for details
+//// Or maybe the library is broken.
 ////////////////////////////////////////////////////////////////////////
 //   CAM_IMAGE_MODE_1024X768    1024x768
 //   CAM_IMAGE_MODE_HD          1280x720
@@ -67,9 +66,42 @@ const bool USE_OLED = true;
 //   CAM_IMAGE_MODE_FHD         1920x1080
 //   CAM_IMAGE_MODE_QXGA        2048x1536   (max for this 3MP sensor) --> lies
 //   CAM_IMAGE_MODE_WQXGA2      2592x1944   (5MP sensor only)
-const CAM_IMAGE_MODE CAPTURE_MODE =   CAM_IMAGE_MODE_HD ;
+
+// Resolution index table -- the receiver's 4-bit RESOLUTION field indexes this, so the
+// order must stay byte-identical to receive.py's RES_NAMES. Index 8 (HD) is the default.
+// TODO: Figure out a better way to keep this in sync with the Python code
+static const CAM_IMAGE_MODE RES_TABLE[] = {
+  CAM_IMAGE_MODE_96X96,     CAM_IMAGE_MODE_128X128,  CAM_IMAGE_MODE_QQVGA,
+  CAM_IMAGE_MODE_QVGA,      CAM_IMAGE_MODE_320X320,  CAM_IMAGE_MODE_VGA,
+  CAM_IMAGE_MODE_SVGA,      CAM_IMAGE_MODE_1024X768, CAM_IMAGE_MODE_HD,
+  CAM_IMAGE_MODE_1280X1024, CAM_IMAGE_MODE_UXGA,     CAM_IMAGE_MODE_FHD,
+  CAM_IMAGE_MODE_QXGA,      CAM_IMAGE_MODE_WQXGA2,
+};
+const uint8_t RES_COUNT   = sizeof(RES_TABLE) / sizeof(RES_TABLE[0]);
+const uint8_t RES_DEFAULT = 8;   
+
 // Enums LOW_QUALITY, DEFAULT_QUALITY, HIGH_QUALITY
 const IMAGE_QUALITY CAPTURE_QUALITY = HIGH_QUALITY;
+
+// --- On-demand config (two-way messaging with the receiver) ---
+// BOOT_CONTINUOUS true  -> boot straight into a continuous timer at the defaults below
+//   (legacy behavior), still listening for a config request in each DELAY gap.
+// BOOT_CONTINUOUS false -> boot idle and send nothing until a request arrives.
+const bool BOOT_CONTINUOUS = true;
+// Firmware delay (N) between sending the ACK and the first capture of a new config.
+const uint32_t REQUEST_TO_CAPTURE_DELAY_S = 5;
+// Request/ACK framing magics (distinct from header/params/fingerprint below).
+const uint8_t REQ_MAGIC[] = {0x72, 0x71};
+const uint8_t ACK_MAGIC[] = {0x72, 0x63};
+
+// Current running config, unpacked from the 32-bit request word (bit layout in receive.py).
+// Defaults to 1280x720 @ 60 s continuous shooting
+bool     cfgContinuous = true;
+uint8_t  cfgResIdx     = RES_DEFAULT;
+uint16_t cfgDelayS     = 60;
+uint16_t cfgCount      = 0;
+bool     activeCfg     = BOOT_CONTINUOUS;   // false -> idle until first request
+uint32_t pendingCfg    = 0;                 // set by listenForConfig()
 
 // --- Camera: VSPI on the free "SD card" bus ---
 const int PIN_SCK  = 14;
@@ -186,8 +218,6 @@ void sendParamsV2(uint32_t image_len, uint16_t Ndata) {
 
 
 const unsigned long SERIAL_BAUD = 115200;
-const unsigned long SEND_INTERVAL_MS = 60000;             // idle wait after each send
-const int COUNTDOWN_S = 10;                               // countdown before each capture
 
 Arducam_Mega myCAM(CS);
 
@@ -199,15 +229,6 @@ void oledMsg(const String& s) {
   display.setTextColor(SSD1306_WHITE);
   display.print(s);
   display.display();
-}
-
-// Count down the given seconds (OLED + serial), then return so capture can start.
-void countdown(int secs) {
-  for (int t = secs; t > 0; t--) {
-    oledMsg("Capture in\n" + String(t) + "s");
-    Serial.printf("Capture in %d...\n", t);
-    delay(1000);
-  }
 }
 
 // Re-point the shared VSPI bus. The camera reads MISO on GPIO36; the SD card
@@ -328,9 +349,8 @@ void sendBufferV2Stream(uint32_t len) {
 }
 
 void captureAndSend() {
-  countdown(COUNTDOWN_S);
   oledMsg("Capturing");
-  myCAM.takePicture(CAPTURE_MODE, CAM_IMAGE_PIX_FMT_JPG);
+  myCAM.takePicture(RES_TABLE[cfgResIdx], CAM_IMAGE_PIX_FMT_JPG);
 
   uint32_t len = myCAM.getTotalLength();
   int num_packets = (len / LORA_TRANSFER_BUFFER) + 1;
@@ -370,6 +390,67 @@ void captureAndSend() {
   sendBufferV2Stream(len);                 // streaming FEC path (any image size)
   oledMsg("Send\nComplete");
   Serial.println("Send complete (streamed).");
+}
+
+// Unpack a 32-bit request word into the current config. MODE bit0: 0=continuous,
+// 1=specific count. RESOLUTION bits1-4, DELAY bits5-19 (s), COUNT bits20-31.
+void applyCfg(uint32_t cfg) {
+  cfgContinuous = (cfg & 0x1) == 0;
+  cfgResIdx     = (uint8_t)((cfg >> 1) & 0xF);
+  if (cfgResIdx >= RES_COUNT) cfgResIdx = RES_DEFAULT;
+  cfgDelayS     = (uint16_t)((cfg >> 5) & 0x7FFF);
+  cfgCount      = (uint16_t)((cfg >> 20) & 0xFFF);
+}
+
+// Listen for an inbound config request for up to `secs` seconds. A request is an 8-byte
+// packet [REQ_MAGIC:2][cfg:4 LE][crc16:2]; on a valid one, store it in pendingCfg and
+// return true. Polling parsePacket() (RX_SINGLE) is fine here -- requests are lone,
+// sporadic packets, not the back-to-back burst that forces the image RX node to RX_CONT.
+bool listenForConfig(uint32_t secs) {
+  uint32_t deadline = millis() + secs * 1000UL;
+  while ((int32_t)(millis() - deadline) < 0) {
+    int ps = LoRa.parsePacket();
+    if (ps <= 0) continue;
+    if (ps == 8) {
+      uint8_t b[8];
+      for (int i = 0; i < 8; i++) b[i] = (uint8_t)LoRa.read();
+      if (b[0] == REQ_MAGIC[0] && b[1] == REQ_MAGIC[1] &&
+          crc16(b, 6) == (uint16_t)(b[6] | (b[7] << 8))) {
+        pendingCfg = (uint32_t)b[2] | ((uint32_t)b[3] << 8) |
+                     ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24);
+        return true;
+      }
+    }
+    while (LoRa.available()) LoRa.read();   // drain anything else off the FIFO
+  }
+  return false;
+}
+
+// Reply to a request: ack = cfg - DELAY*COUNT + RESOLUTION (32-bit wrap), framed as
+// [ACK_MAGIC:2][ack:4 LE][crc16:2].
+void sendAck(uint32_t cfg) {
+  uint8_t  res     = (uint8_t)((cfg >> 1) & 0xF);
+  uint16_t delay_s = (uint16_t)((cfg >> 5) & 0x7FFF);
+  uint16_t count   = (uint16_t)((cfg >> 20) & 0xFFF);
+  uint32_t ack     = cfg - (uint32_t)delay_s * count + res;
+  uint8_t p[8];
+  p[0] = ACK_MAGIC[0]; p[1] = ACK_MAGIC[1];
+  p[2] = (uint8_t)(ack);       p[3] = (uint8_t)(ack >> 8);
+  p[4] = (uint8_t)(ack >> 16); p[5] = (uint8_t)(ack >> 24);
+  uint16_t c = crc16(p, 6);
+  p[6] = (uint8_t)(c & 0xFF); p[7] = (uint8_t)(c >> 8);
+  LoRa.beginPacket(); LoRa.write(p, 8); LoRa.endPacket();
+  Serial.printf("Request 0x%08X -> ACK 0x%08X\n", cfg, ack);
+}
+
+// A request arrived (pendingCfg set): ACK it, wait N seconds, then adopt it and mark the
+// config active so loop() starts capturing.
+void adoptPending() {
+  oledMsg("Config\nrx");
+  sendAck(pendingCfg);
+  delay(REQUEST_TO_CAPTURE_DELAY_S * 1000UL);
+  applyCfg(pendingCfg);
+  activeCfg = true;
 }
 
 void setup() {
@@ -433,6 +514,21 @@ void setup() {
 }
 
 void loop() {
-  captureAndSend();
-  delay(SEND_INTERVAL_MS);  // wait one minute AFTER the image is sent, then repeat
+  // Idle (no active config): send nothing, just listen for a request. This is the boot
+  // state when BOOT_CONTINUOUS is false, and the resting state after a specific-count run.
+  if (!activeCfg) {
+    oledMsg("Idle\nlistening");
+    if (listenForConfig(60)) adoptPending();
+    return;
+  }
+
+  // Continuous: capture forever, DELAY between frames. Specific count: COUNT frames
+  // (COUNT 0/1 -> exactly 1). In both cases the DELAY gap doubles as the config-listen
+  // window, so a new request preempts the current run (ACK -> wait N -> restart).
+  uint32_t target = cfgContinuous ? 0xFFFFFFFFUL : (cfgCount <= 1 ? 1UL : cfgCount);
+  for (uint32_t i = 0; i < target; i++) {
+    captureAndSend();                         // timer starts after the last packet is sent
+    if (listenForConfig(cfgDelayS)) { adoptPending(); return; }
+  }
+  activeCfg = false;   // specific-count run done -> idle-listen for the next request
 }
