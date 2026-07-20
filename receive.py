@@ -301,20 +301,61 @@ def send_request(ser, cfg, budget=120.0):
     return False
 
 
-def receive_images(ser, n=None, idle_finalize=3.0, outdir="."):
+def _params_total(pkt):
+    """If pkt is the v2 params packet, return the total data+parity packet count the
+    burst will send (same arithmetic as receiver.ino); else None."""
+    if len(pkt) >= PARAMS_LEN and pkt[:2] == PARAMS_MAGIC \
+       and crc16_ccitt(pkt[:13]) == (pkt[13] | (pkt[14] << 8)):
+        Ndata = pkt[7] | (pkt[8] << 8)
+        K = pkt[9] | (pkt[10] << 8)
+        M = pkt[11] | (pkt[12] << 8)
+        nblocks = (Ndata + K - 1) // K if K else 0
+        return Ndata + nblocks * M
+    return None
+
+
+def render_serial_progress(recv, total):
+    """In-place progress bar on stderr for the image currently arriving over serial.
+    Unlike the SDR bar this is exact -- we count real packets against the params total."""
+    w = 24
+    if total:
+        frac = min(1.0, recv / total)
+        fill = int(frac * w)
+        bar = "#" * fill + "." * (w - fill)
+        sys.stderr.write(f"\r  receiving [{bar}] {frac * 100:3.0f}%  {recv}/{total} pkts   ")
+    else:
+        sys.stderr.write(f"\r  receiving [{'.' * w}]  {recv} pkts (reading params)   ")
+    sys.stderr.flush()
+
+
+def receive_images(ser, n=None, idle_finalize=3.0, outdir=".", progress=True):
     """Collect header..fingerprint bursts and save each. Stop after n images (n=None:
     forever). Same reassembly as before, refactored so a config run can bound it to n.
     If the burst's single (unprotected) fingerprint packet is lost, finalize the image
     after `idle_finalize` s of silence -- intra-image gaps are ~10 ms, so this can't fire
-    mid-image, and it prevents a count run from hanging on a dropped trailing fingerprint."""
+    mid-image, and it prevents a count run from hanging on a dropped trailing fingerprint.
+    When `progress`, a live packet bar is drawn on stderr for each incoming image."""
     collecting, packets, got, last_rx = False, [], 0, time.time()
+    recv = 0            # data/parity (250-byte) packets seen this image
+    total = None        # expected data+parity count, learned from the params packet
+
+    def finalize(msg):
+        nonlocal got
+        if progress:
+            render_serial_progress(recv, total)
+            sys.stderr.write("\n")          # leave the completed bar on its own line
+            sys.stderr.flush()
+        if msg:
+            print(msg)
+        show_and_save(*reassemble(packets), outdir=outdir)
+        got += 1
+
     while n is None or got < n:
         line = ser.readline().strip()
         if not line:
             if collecting and packets and time.time() - last_rx > idle_finalize:
-                print("  (silence after last packet -- finalizing image)")
-                show_and_save(*reassemble(packets), outdir=outdir)
-                collecting, packets, got = False, [], got + 1
+                finalize("  (silence after last packet -- finalizing image)")
+                collecting, packets = False, []
             continue
         try:
             pkt = bytes.fromhex(line.decode("ascii", "ignore"))       # case-insensitive
@@ -325,22 +366,25 @@ def receive_images(ser, n=None, idle_finalize=3.0, outdir="."):
             # New image starting. If the previous one never got its (single, unprotected)
             # fingerprint packet, finalize it now -- with v2 the params+data+parity suffice.
             if collecting and packets:
-                print("  (no fingerprint seen -- finalizing on next header)")
-                show_and_save(*reassemble(packets), outdir=outdir)
-                got += 1
+                finalize("  (no fingerprint seen -- finalizing on next header)")
                 if n is not None and got >= n:
                     break
             print(f"[{time.strftime('%H:%M:%S')}] header -- receiving image")
-            collecting, packets = True, []
+            collecting, packets, recv, total = True, [], 0, None
             continue
         if not collecting:
             continue
         if pkt[:4] == FINGERPRINT:
             collecting = False
-            show_and_save(*reassemble(packets), outdir=outdir)
-            got += 1
+            finalize(None)
             continue
         packets.append(pkt)
+        if total is None:                       # first CRC-valid params packet sets the total
+            total = _params_total(pkt)
+        if len(pkt) == LORA_PAYLOAD:            # a data or parity packet arrived
+            recv += 1
+            if progress:
+                render_serial_progress(recv, total)
 
 
 def serial_main(args):
@@ -359,7 +403,7 @@ def serial_main(args):
             if cfg is None:
                 print("Listening for images (Ctrl-C to return to menu)...")
                 try:
-                    receive_images(ser, None, outdir=args.outdir)
+                    receive_images(ser, None, outdir=args.outdir, progress=not args.no_progress)
                 except KeyboardInterrupt:
                     print()
                 continue
@@ -369,14 +413,14 @@ def serial_main(args):
                 n = max(1, (cfg >> 20) & 0xFFF)
                 print(f"Waiting for {n} image(s)...")
                 try:
-                    receive_images(ser, n, outdir=args.outdir)
+                    receive_images(ser, n, outdir=args.outdir, progress=not args.no_progress)
                     print(f"Received {n} image(s).")
                 except KeyboardInterrupt:
                     print()
             else:                                         # continuous
                 print("Continuous mode -- receiving (Ctrl-C to return to menu)...")
                 try:
-                    receive_images(ser, None, outdir=args.outdir)
+                    receive_images(ser, None, outdir=args.outdir, progress=not args.no_progress)
                 except KeyboardInterrupt:
                     print()
     except KeyboardInterrupt:
