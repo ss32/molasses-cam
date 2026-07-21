@@ -1,4 +1,6 @@
-# molasses-cam: On-Demand imagery over LoRa, slow as molasses
+# slow-loras: On-Demand imagery over LoRa, slowly
+
+![slow_loris](slow_loris.svg)
 
 
 
