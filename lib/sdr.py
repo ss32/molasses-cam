@@ -52,10 +52,25 @@ FORMATS = {
 }
 
 
-def _worker_init():
-    """Decode-pool workers ignore SIGINT; the main process handles Ctrl-C and shuts the
-    pool down cleanly, instead of every worker raising KeyboardInterrupt at once."""
+def _worker_init(bw):
+    """Set a decode-pool worker up to be self-sufficient regardless of the multiprocessing
+    start method:
+
+      * ignore SIGINT -- the main process handles Ctrl-C and shuts the pool down cleanly,
+        instead of every worker raising KeyboardInterrupt at once;
+      * pin BW / PKT_S to the parent's runtime value, and import the SDR-only heavy deps
+        (scipy signal, shared_memory) the worker functions use.
+
+    All of this is inherited for free under 'fork', but under 'spawn' (the macOS/Windows
+    default) the child re-imports this module fresh -- BW would fall back to its 500 kHz
+    default and sp_signal / shared_memory would be unbound -- so we (re)establish them
+    here rather than relying on fork inheritance."""
+    global BW, PKT_S, sp_signal, shared_memory
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    from scipy import signal as sp_signal
+    from multiprocessing import shared_memory
+    BW = bw
+    PKT_S = pkt_seconds(bw)
 
 
 def iq_blocks(stream, fmt, block_samps, pace=0.0):
@@ -441,8 +456,9 @@ def _reassemble_indexed(located, fs, verbose=False):
     shifting the whole JPEG byte stream. A packet is accepted only if its declared
     length is exactly LORA_PAYLOAD and it has no residual CR4/5 parity violations;
     corrupt / short / wrong-length packets are dropped (they'd otherwise desync the
-    stream). Index is inferred from the packet's raw-sample position and the (regular)
-    inter-packet spacing, since the current wire format carries no sequence number.
+    stream). This is the legacy v1 reassembly (no params packet, so no per-packet seq):
+    index is inferred from the packet's raw-sample position and the (regular) inter-packet
+    spacing. The v2 path (helpers.reassemble_v2) instead places packets by their real seq.
 
     `located` : [(raw_pos, data, payload_len, resid), ...] for every decoded packet
                 (control + data), positions in raw-sample units.
@@ -762,7 +778,10 @@ def sdr_main(args):
     # traceback and the shutdown stalls.
     pool = None
     if args.workers > 1:
-        pool = ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init)
+        # Pass BW as an initarg so workers are correct even under 'spawn' (see _worker_init);
+        # BW is already set above, before the pool is created.
+        pool = ProcessPoolExecutor(max_workers=args.workers,
+                                   initializer=_worker_init, initargs=(BW,))
         list(pool.map(time.sleep, [0.02] * args.workers))   # pre-fork all workers
 
     # Status UI: a curses Dashboard when stdout is a TTY (all packet status streams into

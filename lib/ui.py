@@ -229,7 +229,7 @@ class Dashboard:
 
         scr.erase()
         # Header: title left, source right.
-        title = " molasses-cam"
+        title = " slow-loras"
         put(0, 1, title, self._attr(2, curses.A_BOLD))
         src = f"{self.source}{('  ·  ' + self.subtitle) if self.subtitle else ''} "
         put(0, max(len(title) + 2, w - len(src) - 1), src, self._attr(2))

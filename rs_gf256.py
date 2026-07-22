@@ -10,7 +10,7 @@ packets -- i.e. up to M lost/corrupt packets per block are reconstructed exactly
 
 The coding is applied independently to each byte-column of the packets, so a whole
 lost packet is a single erased symbol shared by every column. This module is the
-Python (decode) side; espArducam_lora32.ino carries a byte-identical encoder (same
+Python (decode) side; sender/sender.ino carries a byte-identical encoder (same
 primitive polynomial 0x11d, same Cauchy construction) -- keep them in lock-step and
 covered by test_rs_gf256.py.
 """
@@ -44,11 +44,13 @@ def gf_inv(a):
     return int(GF_EXP[255 - GF_LOG[a]])
 
 
-# Full 256x256 multiply table for vectorized GF matrix ops (64 KB).
-_MULT = np.zeros((256, 256), dtype=np.uint8)
-for _a in range(256):
-    for _b in range(256):
-        _MULT[_a, _b] = gf_mul(_a, _b)
+# Full 256x256 multiply table for vectorized GF matrix ops (64 KB). Built with the
+# log/exp tables (a*b = exp[log a + log b]) instead of a 65536-iteration Python loop.
+_la = GF_LOG[np.arange(256)].astype(np.int64)          # log of each factor
+_MULT = GF_EXP[_la[:, None] + _la[None, :]]            # exp[log a + log b] (indices <= 508)
+_MULT[0, :] = 0                                        # a==0 or b==0 -> 0
+_MULT[:, 0] = 0
+_MULT = np.ascontiguousarray(_MULT, dtype=np.uint8)
 
 
 def cauchy_matrix(m, k):

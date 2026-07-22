@@ -9,7 +9,7 @@ https://www.lilygo.cc/products/lora3
 #include <Wire.h>
 
 #define SCK 5   // GPIO5  -- SX1278's SCK
-#define MISO 19 // GPIO19 -- SX1278's MISnO
+#define MISO 19 // GPIO19 -- SX1278's MISO
 #define MOSI 27 // GPIO27 -- SX1278's MOSI
 #define SS 18   // GPIO18 -- SX1278's CS
 #define RST 23  // GPIO23 -- SX1278's RESET on the LoRa32 T3 v1.6.1 (NOT GPIO14, which
@@ -33,7 +33,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 const uint8_t header[] = {0x61, 0x79, 0x79, 0x79, 0x79};
 const uint8_t fingerprint[] = {0x6c, 0x6d, 0x61, 0x6f};
 
-uint16_t packetsRecieved = 0;
+uint16_t packetsReceived = 0;
 uint16_t payloadSize = 0;
 bool nextPacketIsPayloadSize = false;
 bool gotHeader = false;
@@ -80,9 +80,13 @@ void IRAM_ATTR onLoraReceive(int packetSize)
   rxReady = true;
 }
 
-bool checkCode(uint8_t *buffer, const uint8_t *code)
+// Compare the first `len` bytes of `buffer` against `code`. `len` is passed
+// explicitly: `code` decays to a pointer here, so sizeof(code) would be the
+// pointer width (4 on ESP32), not the marker length -- which silently compared
+// only 4 of the 5 header bytes.
+bool checkCode(const uint8_t *buffer, const uint8_t *code, size_t len)
 {
-  for (int i = 0; i < sizeof(code); i++)
+  for (size_t i = 0; i < len; i++)
   {
     if (buffer[i] != code[i])
     {
@@ -135,23 +139,24 @@ void processPacket(uint8_t *packet_buffer, int packetSize)
   }
   if(gotHeader){
     upperMessage("Rx Node");
-    lowerMessage("Packet " + String(packetsRecieved) + "/" + String(payloadSize) + "        ");
-    packetsRecieved++;
+    lowerMessage("Packet " + String(packetsReceived) + "/" + String(payloadSize) + "        ");
+    packetsReceived++;
     flushDisplay(false);   // throttled redraw; RX runs in the ISR so this can't drop packets
   }
-  if (checkCode(packet_buffer, header))
+  if (packetSize >= (int)sizeof(header) && checkCode(packet_buffer, header, sizeof(header)))
   {
     upperMessage("Rx Node");
     nextPacketIsPayloadSize = true;
     gotHeader = true;
   }
-  if (checkCode(packet_buffer, fingerprint) && gotHeader)
+  if (packetSize >= (int)sizeof(fingerprint) &&
+      checkCode(packet_buffer, fingerprint, sizeof(fingerprint)) && gotHeader)
   {
     display.clearDisplay();
     upperMessage("Rx Node");
     lowerMessage("Download complete");
     flushDisplay(true);    // end of image: force the final redraw
-    packetsRecieved = 0;
+    packetsReceived = 0;
     gotHeader = false;
   }
 }

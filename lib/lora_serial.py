@@ -76,6 +76,7 @@ def reassemble(packets):
 
 
 def show_and_save(jpg, stats, ui, outdir="."):
+    import cv2                                            # lazy: SDR-only hosts skip opencv
     if not jpg:
         ui.log(f"  no image ({stats}) -- skipped")
         return
@@ -280,8 +281,6 @@ def serial_main(args):
     config form opens modally, and headers / progress / FEC results stream into the
     dashboard's log. 'q' during a receive returns to the config form; Ctrl-C quits. On a
     non-tty host a ConsoleUI reproduces the original plain prompts and stdout/stderr."""
-    global cv2
-    import cv2                                            # noqa: F401 (bound to global, used by show_and_save)
     import serial
     from lib.ui import make_ui
 
@@ -328,6 +327,7 @@ def serial_main(args):
     finally:
         ui.close()
         try:
+            import cv2
             cv2.destroyAllWindows()
         except Exception:
             pass

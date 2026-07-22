@@ -183,7 +183,7 @@ def _draw(stdscr, state, res_names, res_dims, delay_max, count_max, A):
 
     box_w = min(w - 2, 60)
     # Title bar.
-    put(0, 2, "molasses-cam · new capture", A(2, curses.A_BOLD))
+    put(0, 2, "slow-loras · new capture", A(2, curses.A_BOLD))
     put(1, 2, "─" * (box_w - 2), A(2))
 
     # --- Mode ---------------------------------------------------------------

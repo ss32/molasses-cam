@@ -24,7 +24,7 @@
 // parity packets per RS_K-packet block (same framing), then a fingerprint packet. Each
 // packet's seq + CRC16 lets the receiver place packets exactly and the RS parity
 // reconstruct up to RS_M lost/corrupt packets per block. The GF(256)/CRC math is kept
-// byte-identical to rs_gf256.py / decode_lora_image.py. The practical size limit is
+// byte-identical to rs_gf256.py / receive.py. The practical size limit is
 // airtime, not the count (~2 packets/sec over LoRa). If the image can't be buffered in
 // RAM the code falls back to the legacy v1 stream (2-byte count + raw 250-byte chunks,
 // no FEC), which the decoder still auto-detects.
@@ -123,7 +123,7 @@ const int LORA_SS = 18, LORA_RST = 23, LORA_DIO0 = 26;
 // LoRa signal bandwidth. The SX127x default is 125 kHz; raising it ~halves airtime
 // per doubling (250E3 ~2x, 500E3 ~4x) at the cost of ~3 dB sensitivity each step --
 // a good trade on a short-range link. The receiver must match: receiver.ino's
-// setSignalBandwidth and decode_lora_image.py's BW (or its --bw flag).
+// setSignalBandwidth and receive.py's BW (or its --bw flag).
 #define LORA_BW 500E3
 SPIClass loraSPI(HSPI);
 
@@ -135,7 +135,7 @@ SPIClass loraSPI(HSPI);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool haveOLED = false;
 
-// --- LoRa transfer protocol (must match the loracam receiver) ---
+// --- LoRa transfer protocol (must match the slow-loras receiver) ---
 #define LORA_TRANSFER_BUFFER 250
 // Gap after every packet. arduino-LoRa's endPacket() already blocks until TxDone, so
 // this is pure dead air on top of airtime; trimmed 75 -> 10 ms as part of the PHY
@@ -151,7 +151,7 @@ uint8_t lora_buffer[LORA_TRANSFER_BUFFER];
 // packets per RS_K-packet block -- so a lost/corrupt packet no longer desyncs the JPEG.
 // A 15-byte params packet [0x70 0x32][ver][image_len:4][Ndata:2][K:2][M:2][crc16:2]
 // (sent 3x) tells the receiver the geometry. Must stay byte-identical to rs_gf256.py /
-// decode_lora_image.py (GF(256) poly 0x11d, CRC-16/CCITT-FALSE, Cauchy matrix).
+// rs_gf256.py (GF(256) poly 0x11d, CRC-16/CCITT-FALSE, Cauchy matrix).
 #define V2_DATA 246                 // image bytes per packet (250 - 2 seq - 2 crc)
 #define RS_K    32                  // data packets per FEC block
 #define RS_M    4                   // parity packets per block (recovers <=M losses/block)
@@ -353,11 +353,11 @@ void captureAndSend() {
   myCAM.takePicture(RES_TABLE[cfgResIdx], CAM_IMAGE_PIX_FMT_JPG);
 
   uint32_t len = myCAM.getTotalLength();
-  int num_packets = (len / LORA_TRANSFER_BUFFER) + 1;
-  Serial.printf("Captured %u bytes -> %d packets\n", len, num_packets);
+  uint32_t ndata = (len + V2_DATA - 1) / V2_DATA;   // v2 data packets (ceil), 246 B each
+  Serial.printf("Captured %u bytes -> %u data packets\n", len, ndata);
 
-  if (num_packets > 65535) {  // count is sent as two bytes; can't represent more
-    Serial.println("Image too large for 2-byte packet count; skipping frame.");
+  if (ndata > 65535) {  // Ndata is sent as a uint16 in the params packet; can't represent more
+    Serial.println("Image too large for 16-bit Ndata; skipping frame.");
     oledMsg("Too big\nskipped");
     return;
   }

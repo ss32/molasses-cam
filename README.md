@@ -8,7 +8,7 @@
 
 * [LilyGo Lora32](https://lilygo.cc/products/lora3)
   * x2 if you want on-demand imagery
-* Any SDR (optional, receieve-only from the camera)
+* Any SDR (optional, receive-only from the camera)
   * Tested with [RTL-SDR v3](https://www.rtl-sdr.com/buy-rtl-sdr-dvb-t-dongles/)
 * [Arducam Mega SPI Camera](https://www.amazon.com/Arducam-Mega-Camera-Module-Microcontroller/dp/B0BW4L21KS?th=1)
 
@@ -74,7 +74,7 @@ Prereqs: [`arduino-cli`](https://arduino.github.io/arduino-cli/) with the **esp3
 (`arduino-cli core install esp32:esp32`) and the **Arducam_Mega** library cloned to
 `~/Arducam_Mega`.
 
-Use `upload.sh` to compile the sketch in the current directory and flash it. Flash each board from its own sketch dirrectory.
+Use `upload.sh` to compile the sketch in the current directory and flash it. Flash each board from its own sketch directory.
 
 ```bash
 cd sender   && bash ../upload.sh "" /dev/ttyACM0    # camera node
